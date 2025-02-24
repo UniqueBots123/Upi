@@ -1,0 +1,234 @@
+import asyncio
+import os
+import requests
+import qrcode
+import urllib.parse
+import random
+import pytz
+from datetime import datetime
+from telethon import TelegramClient, events
+from telethon.tl.custom import Button  # Correct import of Button
+
+API_ID = "22812640"
+API_HASH = "a03d3210acc79992955563c9de77f795"
+BOT_TOKEN = "7772422954:AAHlUtZBp_Nw5pcFzT22hi5AovD2XbdP-Cs"
+UPI_ID = "paytmqr5n2zyr@ptys"
+ADMIN_IDS = [7401411111, 7766469355]  # List of admin IDs
+LOG_GROUP_ID = -1002383653449
+
+# Bot initialization
+bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+# Store pending payments {user_id: order_id}
+pending_payments = {}
+
+# Order count initialization
+order_count = 0
+
+# Global dictionary to store transactions per IST day
+daily_transactions = {}
+
+# Define IST timezone
+ist = pytz.timezone("Asia/Kolkata")
+
+# Generate Order ID
+def generate_order_id(user_id):
+    global order_count
+    order_count += 1  # Increment order count
+    random_number = random.randint(100, 999)  # Generate a 3-digit random number
+    return f"ORD-{user_id}-{datetime.now().strftime('%H%M%S')}{random_number}-{order_count}"
+
+# Generate UPI QR Code (Without Amount)
+def generate_qr(upi_id, order_id, first_name):
+    first_name = urllib.parse.quote(first_name[:10])  # Max 10 characters, URL-safe
+    txn_note = urllib.parse.quote(first_name[:10])
+    upi_link = f"upi://pay?pa={upi_id}&pn=NRBoTs&tr={order_id}&tn=payby{txn_note}&cu=INR"
+
+    # Generate QR Code
+    qr = qrcode.make(upi_link)
+    qr_path = f"qr_{order_id}.png"
+    qr.save(qr_path)
+    
+    return qr_path
+
+# Record the transaction into our daily tracker
+def record_transaction(txn_amount):
+    # Convert the current UTC time to IST
+    current_ist = datetime.now(pytz.utc).astimezone(ist)
+    date_str = current_ist.strftime('%Y-%m-%d')  # e.g., '2025-02-16'
+
+    # Initialize the record for the date if it doesn't exist
+    if date_str not in daily_transactions:
+        daily_transactions[date_str] = {
+            "transactions": 0,
+            "total_amount": 0.0,
+            "amounts": {}  # To store frequency for each amount
+        }
+
+    # Update the total transaction count and amount
+    daily_transactions[date_str]["transactions"] += 1
+    daily_transactions[date_str]["total_amount"] += txn_amount
+
+    # Track how many times this specific amount has been processed
+    if txn_amount in daily_transactions[date_str]["amounts"]:
+        daily_transactions[date_str]["amounts"][txn_amount] += 1
+    else:
+        daily_transactions[date_str]["amounts"][txn_amount] = 1
+
+# Generate summary for a specific date
+def generate_daily_summary(date_str):
+    if date_str not in daily_transactions:
+        return f"No transactions recorded for {date_str}."
+    
+    summary = daily_transactions[date_str]
+    lines = []
+    # List each unique amount multiplied by its transaction count
+    for amount, count in summary["amounts"].items():
+        total_for_amount = amount * count
+        lines.append(f"{amount} x {count} = {total_for_amount}")
+    
+    lines.append(f"\nTotal Transactions: {summary['transactions']}")
+    lines.append(f"Total Amount: {summary['total_amount']}")
+    return "\n".join(lines)
+
+@bot.on(events.NewMessage(pattern="/start"))
+async def start(event):
+    user_id = event.sender_id
+    await bot.send_message(user_id, "👋 Welcome! Do you want to make a payment?", 
+                           buttons=[Button.inline("✅ Yes", data="start_payment")])
+
+@bot.on(events.CallbackQuery(data="start_payment"))
+async def start_payment(event):
+    user_id = event.sender_id
+
+    if user_id in pending_payments:
+        await event.answer("You already have an ongoing payment. Please wait for the previous payment to complete.")
+        return  # Exit if there's already a pending payment
+
+    user = await bot.get_entity(user_id)
+    first_name = user.first_name[:10]  # Max 10 characters
+
+    order_id = generate_order_id(user_id)
+    qr_path = generate_qr(UPI_ID, order_id, first_name)
+    pending_payments[user_id] = order_id  # Store the order ID for tracking
+
+    # Send QR Code
+    message = await bot.send_message(
+        user_id,
+        f"🛒 *Order ID:* `{order_id}`\n\nScan the QR Code to Pay.\n\nAfter payment, please send your payment screenshot to @whistlexbot for verification.",
+        file=qr_path,
+        parse_mode="Markdown"
+    )
+
+    # Start Payment Verification
+    asyncio.create_task(check_payment_status(user_id, order_id, message.id, qr_path))
+
+async def check_payment_status(user_id, order_id, message_id, qr_path):
+    """
+    Fetches payment status from API at intervals.
+    """
+    check_intervals = [20, 5]  # Initial delays (seconds)
+    poll_interval = 3  # Repeated check interval (seconds)
+    url = f"https://paytm-api.lightdns.me/?mid=oGnTze59931019253516&oid={order_id}"
+
+    # Send waiting emoji message
+    waiting_msg = await bot.send_message(user_id, "⏳ Waiting for payment verification...")
+
+    retry_count = 0  # To keep track of the number of checks
+    max_retries = 92  # Maximum retries before timing out
+
+    while retry_count < max_retries:
+        await asyncio.sleep(check_intervals.pop(0) if check_intervals else poll_interval)
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get("STATUS", "")
+            txn_amount = data.get("TXNAMOUNT", "")
+            txn_msg = data.get("RESPMSG", "")
+            txn_count = data.get("currentTxnCount", "")
+
+            if status == "TXN_SUCCESS":
+                # Record the transaction (convert txn_amount to float)
+                txn_amount_float = float(txn_amount)
+                record_transaction(txn_amount_float)
+
+                user = await bot.get_entity(user_id)
+                payment_details = f"""
+✅ **Payment Received!**
+👤 **User:** [{user.first_name}](tg://user?id={user_id})
+🔹 **Username:** @{user.username if user.username else "N/A"}
+🆔 **User ID:** `{user_id}`
+📛 **Full Name:** {user.first_name} {user.last_name if user.last_name else ""}
+🛒 **Order ID:** `{order_id}`
+💰 **Amount:** ₹{txn_amount}
+📌 **Transaction Status:** ✅ {txn_msg}
+📟 **TxnCount:** {txn_count}
+                """
+                
+                await bot.send_message(LOG_GROUP_ID, payment_details, parse_mode="Markdown", reply_to=112)
+                
+                await bot.send_message(
+                    user_id, 
+                    f"✅ Payment successful! of ₹{txn_amount} \nYour order will be completed within 48 hours. \n🛒 Your order ID is `{order_id}`\n\nPlease send your payment screenshot to @whistlexbot for verification.",
+                    buttons=[
+                        [Button.url("✅ Payment Successful", "https://t.me/whistlexbot")]
+                    ]
+                )
+
+                # Remove waiting message & QR code
+                await bot.delete_messages(user_id, [waiting_msg.id, message_id])
+                os.remove(qr_path)
+                
+                del pending_payments[user_id]  # Remove completed payment
+                break  # Exit loop when payment is confirmed
+            
+        else:
+            print("Error fetching payment status. Retrying...")
+
+        retry_count += 1  # Increment retry count
+        if retry_count >= max_retries:
+            await bot.delete_messages(user_id, [waiting_msg.id, message_id])
+            os.remove(qr_path)
+            del pending_payments[user_id]
+            await bot.send_message(
+                user_id, 
+                "❌ Payment not completed in time. Try again later.",
+                buttons=[
+                    [Button.inline("♻️ Regenerate QR", data="start_payment")]
+                ]
+            )
+            break
+
+    # Timeout handling if necessary
+    if retry_count >= max_retries:
+        user = await bot.get_entity(user_id)
+        await bot.send_message(
+            LOG_GROUP_ID, 
+            f"""❌ Failed transaction
+
+👤 **User:** [{user.first_name}](tg://user?id={user_id})
+🔹 **Username:** @{user.username if user.username else "N/A"}
+🆔 **User ID:** `{user_id}`
+📛 **Full Name:** {user.first_name} {user.last_name if user.last_name else ""}
+🛒 **Order ID:** `{order_id}`
+""",
+            parse_mode="Markdown",
+            reply_to=113
+        )
+
+# New admin-only command to get today's transaction summary in IST
+@bot.on(events.NewMessage(pattern="/summary"))
+async def summary(event):
+    if event.sender_id not in ADMIN_IDS:
+        await bot.send_message(event.sender_id, "❌ You are not authorized to use this command.")
+        return
+
+    # Use the current IST date
+    current_date_str = datetime.now(pytz.utc).astimezone(ist).strftime('%Y-%m-%d')
+    summary_text = generate_daily_summary(current_date_str)
+    await bot.send_message(event.sender_id, summary_text)
+
+# Run the bot
+print("Bot is running...")
+bot.run_until_disconnected()
